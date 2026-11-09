@@ -231,8 +231,9 @@ final class WeatherRepository: ObservableObject {
         let thisYear = cal.component(.year, from: now)
         var out: [DayForecast] = []
         for f in arr.prefix(5) {
-            guard let fi = f["fi"] as? String, let parts = fmt.dateComponents(from: fi),
-                  let month = parts.month, let day = parts.day else { continue }
+            guard let fi = f["fi"] as? String, let parsed = fmt.date(from: fi) else { continue }
+            let p = cal.dateComponents([.month, .day], from: parsed)
+            guard let month = p.month, let day = p.day else { continue }
             var comps = DateComponents(year: thisYear, month: month, day: day)
             guard var date = cal.date(from: comps) else { continue }
             // 跨年修正：解析出的日期早于今天超过一天则视为明年
