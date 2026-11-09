@@ -45,8 +45,6 @@ public final class AppSettings: ObservableObject {
         useCurrentLocation = d.bool(forKey: Key.useLocation)
     }
 
-    /// 实际请求用的坐标与城市 ID
-    public var effectiveCity: City { city }
     public var effectiveLat: Double { Double(manualLat) ?? city.lat }
     public var effectiveLon: Double { Double(manualLon) ?? city.lon }
     public var effectiveCityID: String { manualCityID.isEmpty ? city.id : manualCityID }
@@ -74,68 +72,116 @@ final class WeatherRepository: ObservableObject {
         snapshot = SharedStore.load()
     }
 
-    // MARK: 官方接口通用请求（需带 Referer/Cookie，返回 "var xxx = {...}" 前缀）
+    // MARK: 官方接口：拉取文本并解析多个 "var NAME = {...};" 片段
 
-    private func officialJSON(url: String, cityID: String) async throws -> [String: Any] {
+    private func officialText(url: String, cityID: String) async throws -> String {
         guard let u = URL(string: url) else { throw URLError(.badURL) }
         var req = URLRequest(url: u)
         req.setValue("https://www.weather.com.cn/", forHTTPHeaderField: "Referer")
         req.setValue("city=\(cityID)", forHTTPHeaderField: "Cookie")
         req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
         let (data, _) = try await session.data(for: req)
-        var text = String(decoding: data, as: UTF8.self)
-        // 剥离 JS 变量前缀，截取第一个 { 到最后一个 }
-        if let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}") {
-            text = String(text[start...end])
-        }
-        guard let d = text.data(using: .utf8),
-              let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any] else {
-            throw URLError(.cannotParseResponse)
-        }
-        return obj
+        return String(decoding: data, as: UTF8.self)
     }
 
-    // MARK: 拉取全部数据
+    /// 解析 JS 文本中所有顶层 `var name = {…}/[…]` 对象
+    private func parseJSVars(_ text: String) -> [String: Any] {
+        let chars = Array(text)
+        var out: [String: Any] = [:]
+        var i = 0
+        while i + 3 < chars.count {
+            if chars[i] == "v", chars[i+1] == "a", chars[i+2] == "r", chars[i+3] == " " {
+                var j = i + 4
+                var name = ""
+                while j < chars.count, chars[j] != "=" { name.append(chars[j]); j += 1 }
+                name = name.trimmingCharacters(in: .whitespaces)
+                j += 1
+                while j < chars.count, chars[j] == " " { j += 1 }
+                guard j < chars.count, chars[j] == "{" || chars[j] == "[" else { i += 1; continue }
+                let open = chars[j]
+                let close: Character = open == "{" ? "}" : "]"
+                var depth = 0, k = j, inStr = false, esc = false
+                while k < chars.count {
+                    let c = chars[k]
+                    if inStr {
+                        if esc { esc = false }
+                        else if c == "\\" { esc = true }
+                        else if c == "\"" { inStr = false }
+                    } else {
+                        if c == "\"" { inStr = true }
+                        else if c == open { depth += 1 }
+                        else if c == close { depth -= 1; if depth == 0 { break } }
+                    }
+                    k += 1
+                }
+                if k < chars.count, depth == 0 {
+                    let jsonStr = String(chars[j...k])
+                    if let dd = jsonStr.data(using: .utf8),
+                       let obj = try? JSONSerialization.jsonObject(with: dd) {
+                        out[name] = obj
+                    }
+                }
+                i = k + 1
+            } else { i += 1 }
+        }
+        return out
+    }
+
+    /// dingzhi/alarm 变量名带城市 ID 后缀（如 cityDZ101260307），按前缀查找
+    private func findVar(_ vars: [String: Any], prefix: String) -> Any? {
+        if let v = vars[prefix] { return v }
+        if let key = vars.keys.first(where: { $0.hasPrefix(prefix) }) { return vars[key] }
+        return nil
+    }
+
+    // MARK: 拉取全部数据（单项失败不阻断，官方全挂时 Open-Meteo 兜底）
 
     func refresh(for city: City? = nil) async {
         let s = AppSettings.shared
-        let target = city ?? s.effectiveCity
+        let target = city ?? s.city
         let lat = s.effectiveLat, lon = s.effectiveLon
         let cityID = s.effectiveCityID
         isLoading = true
         lastError = nil
         do {
-            // 官方：实况 + 逐天 + 预警 + MPF 短临，并发请求
             async let sk = fetchOfficialCurrent(cityID: cityID)
-            async let daily = fetchOfficialDaily(cityID: cityID)
-            async let alerts = fetchOfficialAlerts(cityID: cityID)
-            async let minute = fetchOfficialMinute(lat: lat, lon: lon)
+            async let wi = fetchOfficialWeatherIndex(cityID: cityID)
+            async let mpf = fetchOfficialMinute(lat: lat, lon: lon)
 
-            var (cur, days, als, minF) = try await (sk, daily, alerts, minute)
-
-            // 和风增强（可选）：补 AQI/更多天数、1km 雷达临近预报
+            let cur = try? await sk
+            let (days, als) = (try? await wi) ?? ([], [])
+            let minF = (try? await mpf) ?? MinuteForecast()
             var source: DataSourceKind = .official
+
+            var finalCur = cur
+            var finalDays = days
+            var finalMin = minF
+
+            // 和风增强（可选）：补分钟级/实况
             if s.hasQWeather {
-                source = .officialQWeather
-                if !minF.available, let qm = try? await fetchQWeatherMinutely(lat: lat, lon: lon, key: s.qweatherKey, host: s.qweatherHost) {
-                    minF = qm
-                    source = .qWeatherOnly
+                if !finalMin.available, let qm = try? await fetchQWeatherMinutely(lat: lat, lon: lon, key: s.qweatherKey, host: s.qweatherHost) {
+                    finalMin = qm
+                    source = .officialQWeather
                 }
-                if cur == nil, let qc = try? await fetchQWeatherNow(lat: lat, lon: lon, key: s.qweatherKey, host: s.qweatherHost) {
-                    cur = qc
+                if finalCur == nil, let qc = try? await fetchQWeatherNow(lat: lat, lon: lon, key: s.qweatherKey, host: s.qweatherHost) {
+                    finalCur = qc
+                    source = .officialQWeather
                 }
             }
-            // Open-Meteo CMA GRAPES 15 分钟兜底：官方短临不可用时
-            if !minF.available {
+            // Open-Meteo CMA GRAPES 15 分钟兜底：官方全部不可用时
+            if finalCur == nil && finalDays.isEmpty && !finalMin.available {
                 if let om = try? await fetchOpenMeteo(lat: lat, lon: lon) {
-                    minF = om.minute
-                    if cur == nil { cur = om.current }
-                    if days.isEmpty { days = om.days }
-                    if source == .official { source = .openMeteo }
+                    finalCur = om.current
+                    finalDays = om.days
+                    finalMin = om.minute
+                    source = .openMeteo
                 }
+            }
+            guard finalCur != nil || !finalDays.isEmpty || finalMin.available else {
+                throw URLError(.cannotParseResponse)
             }
 
-            let snap = WeatherSnapshot(city: target, current: cur, days: days, minute: minF,
+            let snap = WeatherSnapshot(city: target, current: finalCur, days: finalDays, minute: finalMin,
                                        alerts: als, source: source, fetchedAt: Date())
             snapshot = snap
             SharedStore.save(snap)
@@ -146,99 +192,115 @@ final class WeatherRepository: ObservableObject {
         isLoading = false
     }
 
-    // MARK: 官方 · 实况（d1 sk_2d）
+    // MARK: 官方 · 实况（d1 sk_2d → var dataSK）
 
     private func fetchOfficialCurrent(cityID: String) async throws -> CurrentWeather? {
-        let obj = try await officialJSON(url: "https://d1.weather.com.cn/sk_2d/\(cityID).html?_=\(Int(Date().timeIntervalSince1970))",
+        let text = try await officialText(url: "https://d1.weather.com.cn/sk_2d/\(cityID).html?_=\(Int(Date().timeIntervalSince1970))",
                                          cityID: cityID)
-        guard let tempS = obj["temp"] as? String, let temp = Int(tempS) else { return nil }
-        let code = (obj["weathercode"] as? String) ?? ""
-        let windDeg = Double((obj["WD"] as? String) ?? (obj["winddegrees"] as? String) ?? "0") ?? 0
-        let windName = WeatherText.windName(degrees: windDeg)
+        guard let sk = parseJSVars(text)["dataSK"] as? [String: Any],
+              let temp = Double(sk["temp"] as? String ?? "") else { return nil }
+        let code = Self.stripCode(sk["weathercode"] as? String ?? "")
         return CurrentWeather(
-            tempC: temp,
-            feelsC: Int(obj["main"] as? String ?? ""),
+            tempC: Int(temp.rounded()),
             weatherCode: code,
-            weatherText: WeatherText.fromCode(code),
-            humidity: Int(obj["humidity"] as? String ?? ""),
-            windDirec: windName,
-            windPower: (obj["WS"] as? String) ?? (obj["windsc"] as? String) ?? "",
-            rainMM: Double(obj["rain"] as? String ?? ""),
+            weatherText: (sk["weather"] as? String) ?? WeatherText.fromCode(code),
+            humidity: Int((sk["SD"] as? String ?? "").replacingOccurrences(of: "%", with: "")),
+            windDirec: (sk["WD"] as? String) ?? "",
+            windPower: (sk["WS"] as? String) ?? "",
+            rainMM: Double(sk["rain"] as? String ?? ""),
             updatedAt: Date())
     }
 
-    // MARK: 官方 · 逐天（d1 weather_index）
+    // MARK: 官方 · 逐天 + 预警（d1 weather_index → var fc / alarmDZ）
 
-    private func fetchOfficialDaily(cityID: String) async throws -> [DayForecast] {
-        let obj = try await officialJSON(url: "https://d1.weather.com.cn/weather_index/\(cityID).html",
-                                         cityID: cityID)
-        guard let data = obj["data"] as? [String: Any],
-              let fc = data["fc"] as? [[String: Any]] else { return [] }
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyyMMdd"
+    private func fetchOfficialWeatherIndex(cityID: String) async throws -> ([DayForecast], [WeatherAlert]) {
+        let text = try await officialText(url: "https://d1.weather.com.cn/weather_index/\(cityID).html",
+                                          cityID: cityID)
+        let vars = parseJSVars(text)
+        let days = Self.parseDaily(vars["fc"] as? [String: Any])
+        let alerts = Self.parseAlerts(findVar(vars, prefix: "alarmDZ") as? [String: Any])
+        return (days, alerts)
+    }
+
+    static func parseDaily(_ fc: [String: Any]?) -> [DayForecast] {
+        guard let arr = fc?["f"] as? [[String: Any]] else { return [] }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MM/d"
+        let cal = Calendar(identifier: .gregorian)
+        let now = Date()
+        let thisYear = cal.component(.year, from: now)
         var out: [DayForecast] = []
-        for f in fc.prefix(5) {
-            guard let key = f["f"] as? String, let date = fmt.date(from: key) else { continue }
+        for f in arr.prefix(5) {
+            guard let fi = f["fi"] as? String, let parts = fmt.dateComponents(from: fi),
+                  let month = parts.month, let day = parts.day else { continue }
+            var comps = DateComponents(year: thisYear, month: month, day: day)
+            guard var date = cal.date(from: comps) else { continue }
+            // 跨年修正：解析出的日期早于今天超过一天则视为明年
+            if date < cal.date(byAdding: .day, value: -1, to: now)! {
+                comps.year = thisYear + 1
+                guard let next = cal.date(from: comps) else { continue }
+                date = next
+            }
+            let df = cal.dateComponents([.year, .month, .day], from: date)
+            let key = String(format: "%04d%02d%02d", df.year ?? 0, df.month ?? 0, df.day ?? 0)
             out.append(DayForecast(
                 dateKey: key, date: date,
-                highC: Int(f["ft"] as? String ?? "") ?? 0,
-                lowC: Int(f["nf"] as? String ?? "") ?? 0,
-                dayWeatherCode: (f["fa"] as? String) ?? "",
-                nightWeatherCode: (f["na"] as? String) ?? "",
-                windDirecCode: (f["fd"] as? String) ?? "",
-                windPower: (f["fp"] as? String) ?? "",
-                precipProb: Int(f["f6"] as? String ?? "")))
+                highC: Int(f["fc"] as? String ?? "") ?? 0,
+                lowC: Int(f["fd"] as? String ?? "") ?? 0,
+                dayWeatherCode: stripCode(f["fa"] as? String ?? ""),
+                nightWeatherCode: stripCode(f["fb"] as? String ?? ""),
+                windDirecCode: (f["fe"] as? String) ?? "",
+                windPower: (f["fg"] as? String) ?? "",
+                precipProb: nil))
         }
         return out
     }
 
-    // MARK: 官方 · 预警（dingzhi 接口生效预警）
-
-    private func fetchOfficialAlerts(cityID: String) async throws -> [WeatherAlert] {
-        let obj = try await officialJSON(url: "https://d1.weather.com.cn/dingzhi/\(cityID).html?_=\(Int(Date().timeIntervalSince1970))",
-                                         cityID: cityID)
-        guard let alarm = obj["alarm"] as? [[String: Any]] else { return [] }
-        return alarm.compactMap { a in
-            guard let title = (a["a1"] as? String) ?? (a["alertName"] as? String) else { return nil }
-            return WeatherAlert(title: title, text: (a["a2"] as? String) ?? (a["alertDetail"] as? String) ?? "",
-                                issuedAt: nil)
+    static func parseAlerts(_ alarm: [String: Any]?) -> [WeatherAlert] {
+        guard let w = alarm?["w"] as? [[String: Any]] else { return [] }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm"
+        return w.compactMap { a in
+            guard let type = a["w5"] as? String, let level = a["w7"] as? String else { return nil }
+            return WeatherAlert(title: "\(type)\(level)预警",
+                                text: (a["w9"] as? String) ?? "",
+                                issuedAt: fmt.date(from: (a["w8"] as? String) ?? ""))
         }
     }
 
-    // MARK: 官方 · MPF 分钟级短临（1km、逐 6 分钟、未来 2 小时）
+    /// "d07"/"n02"/"d7" → "07"/"02"/"07"
+    static func stripCode(_ s: String) -> String {
+        guard let first = s.first, first == "d" || first == "n" else { return s }
+        let rest = String(s.dropFirst())
+        return rest.count == 1 ? "0" + rest : rest
+    }
+
+    // MARK: 官方 · MPF 分钟级短临（times/values 平行数组，逐 6 分钟）
 
     private func fetchOfficialMinute(lat: Double, lon: Double) async throws -> MinuteForecast {
         let url = "http://mpf.weather.com.cn/mpf_v3/webgis/minute?lat=\(String(format: "%.4f", lat))&lon=\(String(format: "%.4f", lon))"
-        guard let u = URL(string: url) else { throw URLError(.badURL) }
-        var req = URLRequest(url: u)
-        req.setValue("https://www.weather.com.cn/", forHTTPHeaderField: "Referer")
-        let (data, _) = try await session.data(for: req)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let text = try await officialText(url: url, cityID: "")
+        guard let obj = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
+              (obj["status"] as? String) == "true",
+              let times = obj["times"] as? [String],
+              let values = obj["values"] as? [Double] else {
             throw URLError(.cannotParseResponse)
         }
-        // 兼容两种返回：{"data":{"predict":[{time,pop/rain}...]}} 或直接数组
-        var raw: [[String: Any]] = []
-        if let d = obj["data"] as? [String: Any] {
-            raw = (d["predict"] as? [[String: Any]]) ?? (d["list"] as? [[String: Any]]) ?? []
-        } else if let arr = obj["predict"] as? [[String: Any]] {
-            raw = arr
-        }
-        let fmt = DateFormatter(); fmt.dateFormat = "HH:mm"
-        let cal = Calendar.current
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
         var points: [MinutePoint] = []
-        for item in raw {
-            guard let t = item["time"] as? String, let time = fmt.date(from: t) else { continue }
-            var comps = cal.dateComponents([.year, .month, .day], from: Date())
-            comps.hour = cal.component(.hour, from: time)
-            comps.minute = cal.component(.minute, from: time)
-            guard let date = cal.date(from: comps) else { continue }
-            let precip = Double((item["rain"] as? String) ?? (item["pop"] as? String) ?? (item["value"] as? String) ?? "0") ?? 0
-            points.append(MinutePoint(time: date, precipMM: precip))
+        for (i, t) in times.enumerated() where i < values.count {
+            if let date = fmt.date(from: t) {
+                points.append(MinutePoint(time: date, precipMM: values[i]))
+            }
         }
         guard !points.isEmpty else { throw URLError(.cannotParseResponse) }
-        return MinuteForecast(issuedAt: Date(), points: points, available: true, source: .official)
+        return MinuteForecast(issuedAt: fmt.date(from: (obj["uptime"] as? String) ?? ""),
+                              points: points, available: true, source: .official,
+                              summary: obj["msg"] as? String)
     }
 
-    // MARK: 和风 v7 · 分钟级雷达（可选增强）
+    // MARK: 和风 v7（可选增强）
 
     private func fetchQWeatherMinutely(lat: Double, lon: Double, key: String, host: String) async throws -> MinuteForecast {
         let url = "https://\(host)/v7/minutely/5m?location=\(String(format: "%.2f,%.2f", lon, lat))&key=\(key)"
@@ -295,10 +357,8 @@ final class WeatherRepository: ObservableObject {
             throw URLError(.cannotParseResponse)
         }
         let iso = ISO8601DateFormatter()
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withFullDate]
+        let dayFmt = DateFormatter(); dayFmt.dateFormat = "yyyy-MM-dd"
 
-        // current
         var current: CurrentWeather?
         if let c = obj["current"] as? [String: Any] {
             let deg = (c["wind_direction_10m"] as? Double) ?? 0
@@ -313,7 +373,6 @@ final class WeatherRepository: ObservableObject {
                 rainMM: nil, updatedAt: Date())
         }
 
-        // minutely_15
         var points: [MinutePoint] = []
         if let m = obj["minutely_15"] as? [String: Any],
            let times = m["time"] as? [String],
@@ -325,9 +384,8 @@ final class WeatherRepository: ObservableObject {
             }
         }
         let minute = MinuteForecast(issuedAt: Date(), points: points,
-                                   available: !points.isEmpty, source: .openMeteo)
+                                    available: !points.isEmpty, source: .openMeteo)
 
-        // daily
         var days: [DayForecast] = []
         if let d = obj["daily"] as? [String: Any],
            let times = d["time"] as? [String],
@@ -335,7 +393,7 @@ final class WeatherRepository: ObservableObject {
            let lows = d["temperature_2m_min"] as? [Double],
            let codes = d["weather_code"] as? [Double] {
             for i in 0..<min(times.count, 5) {
-                guard let date = fmt.date(from: times[i]) else { continue }
+                guard let date = dayFmt.date(from: times[i]) else { continue }
                 let key = times[i].replacingOccurrences(of: "-", with: "")
                 days.append(DayForecast(
                     dateKey: key, date: date,
@@ -366,7 +424,7 @@ final class WeatherRepository: ObservableObject {
         }
     }
 
-    // MARK: 城市搜索（中国天气网官方 toy1）
+    // MARK: 城市搜索（中国天气网官方 toy1，JSONP ref 串格式）
 
     struct SearchCity: Identifiable, Hashable {
         var id: String { cityID }
@@ -378,23 +436,23 @@ final class WeatherRepository: ObservableObject {
 
     func searchCities(keyword: String) async throws -> [SearchCity] {
         let kw = keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? keyword
-        let url = "https://toy1.weather.com.cn/search?cityname=\(kw)&type=1&_=\(Int(Date().timeIntervalSince1970))"
-        guard let u = URL(string: url) else { throw URLError(.badURL) }
-        var req = URLRequest(url: u)
-        req.setValue("https://www.weather.com.cn/", forHTTPHeaderField: "Referer")
-        let (data, _) = try await session.data(for: req)
-        var text = String(decoding: data, as: UTF8.self)
-        if let start = text.firstIndex(of: "["), let end = text.lastIndex(of: "]") {
-            text = String(text[start...end])
+        let text = try await officialText(url: "https://toy1.weather.com.cn/search?cityname=\(kw)&type=1&_=\(Int(Date().timeIntervalSince1970))",
+                                          cityID: "")
+        let vars = parseJSVars(text)
+        // toy1 返回 ([{...}])：parseJSVars 会把整个数组存为 "" 键；兜底直接找数组
+        var arr = (vars[""] as? [[String: Any]])
+        if arr == nil {
+            if let s = text.range(of: "["), let e = text.range(of: "]", range: s.upperBound..<text.endIndex) {
+                let jsonStr = String(text[s.lowerBound...e.lowerBound])
+                arr = (try? JSONSerialization.jsonObject(with: Data(jsonStr.utf8))) as? [[String: Any]]
+            }
         }
-        guard let d = text.data(using: .utf8),
-              let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return [] }
-        return arr.compactMap { item in
-            guard let cityID = item["cityid"] as? String, !cityID.isEmpty else { return nil }
-            return SearchCity(cityID: cityID,
-                              name: (item["key"] as? String) ?? (item["city"] as? String) ?? "",
-                              city: (item["city"] as? String) ?? "",
-                              province: (item["up"] as? String) ?? "")
+        guard let list = arr else { return [] }
+        return list.compactMap { item in
+            guard let ref = item["ref"] as? String else { return nil }
+            let f = ref.split(separator: "~", omittingEmptySubsequences: false).map(String.init)
+            guard f.count >= 5, !f[0].isEmpty else { return nil }
+            return SearchCity(cityID: f[0], name: f[2], city: f[4], province: f.last ?? "")
         }
     }
 }

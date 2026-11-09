@@ -56,12 +56,15 @@ public struct MinuteForecast: Codable, Hashable {
     public var points: [MinutePoint]
     public var available: Bool
     public var source: DataSourceKind
+    /// 官方 msg 文案，如"未来两小时内无雨"
+    public var summary: String?
 
-    public init(issuedAt: Date? = nil, points: [MinutePoint] = [], available: Bool = false, source: DataSourceKind = .none) {
+    public init(issuedAt: Date? = nil, points: [MinutePoint] = [], available: Bool = false, source: DataSourceKind = .none, summary: String? = nil) {
         self.issuedAt = issuedAt
         self.points = points
         self.available = available
         self.source = source
+        self.summary = summary
     }
 
     /// 从 from 起：多少分钟后开始下雨（nil = 未来 2 小时无明显降水）

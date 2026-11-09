@@ -23,8 +23,13 @@ struct ContentView: View {
                         .padding()
                     }
                 } else {
-                    placeholderCard("等待首次更新", "打开 App 后会自动获取一次数据")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    VStack(spacing: 12) {
+                        placeholderCard("等待首次更新", repo.isLoading ? "正在获取数据…" : "打开 App 后会自动获取一次数据")
+                        if let err = repo.lastError {
+                            Text(err).font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             .navigationTitle("天气 · 分钟级")
@@ -92,8 +97,12 @@ struct ContentView: View {
                 } else {
                     Text("未来 2 小时无明显降水").font(.title2.bold())
                 }
-                Text("中国天气网官方短临 · 起报 \(m.issuedAt?.formatted(.dateTime.hour().minute()) ?? "--")")
-                    .font(.caption).foregroundStyle(.secondary)
+                if let msg = m.summary, !msg.isEmpty {
+                    Text(msg).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("中国天气网官方短临 · 起报 \(m.issuedAt?.formatted(.dateTime.hour().minute()) ?? "--")")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             } else {
                 Text("分钟级降水暂不可用").font(.headline)
                 Text("将使用逐小时预报兜底").font(.caption).foregroundStyle(.secondary)
