@@ -28,6 +28,14 @@ struct ContentView: View {
                         if let err = repo.lastError {
                             Text(err).font(.caption).foregroundStyle(.orange)
                         }
+                        Button {
+                            Task { await repo.refresh() }
+                        } label: {
+                            Label("立即重试", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        Text("Build \(WeatherRepository.buildTag) · \(repo.isLoading ? "获取中" : "空闲")")
+                            .font(.caption2).foregroundStyle(.tertiary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }

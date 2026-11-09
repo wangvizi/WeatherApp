@@ -57,6 +57,7 @@ public final class AppSettings: ObservableObject {
 @MainActor
 final class WeatherRepository: ObservableObject {
     static let shared = WeatherRepository()
+    static let buildTag = "v1.1-parserfix"
 
     @Published var snapshot: WeatherSnapshot?
     @Published var isLoading = false
@@ -188,6 +189,14 @@ final class WeatherRepository: ObservableObject {
             SharedStore.reloadWidgets()
         } catch {
             lastError = "获取失败，已保留上次数据；请检查网络后重试"
+            // 失败自动重试一次（网络瞬断/超时）
+            if snapshot == nil {
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    guard let self, self.snapshot == nil else { return }
+                    await self.refresh()
+                }
+            }
         }
         isLoading = false
     }
