@@ -33,7 +33,7 @@ struct SettingsView: View {
                     TextField("经度 lon，如 105.9472", text: $settings.manualLon)
                         .keyboardType(.numbersAndPunctuation)
                     TextField("中央气象台城市 ID", text: $settings.manualCityID)
-                        .keyboardType(.number)
+                        .keyboardType(.numberPad)
                 } header: {
                     Text("高级 · 手动填写坐标与城市 ID")
                 } footer: {

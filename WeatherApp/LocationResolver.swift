@@ -11,7 +11,7 @@ final class LocationResolver: NSObject, ObservableObject, CLLocationManagerDeleg
     @Published var statusMessage: String?
 
     private let manager = CLLocationManager()
-    private var continuation: CheckedContinuation<(Double, Double), Error>?
+    private var continuation: CheckedContinuation<(lat: Double, lon: Double), Error>?
 
     func requestLocation() async throws -> (lat: Double, lon: Double) {
         manager.delegate = self
