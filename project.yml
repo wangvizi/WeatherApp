@@ -1,0 +1,39 @@
+name: WeatherApp
+options:
+  bundleIdPrefix: cn.weatherwidget
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+targets:
+  WeatherApp:
+    type: application
+    platform: iOS
+    sources:
+      - WeatherApp
+      - Shared
+      - Assets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.weatherwidget.app
+        INFOPLIST_FILE: WeatherApp/Info.plist
+        GENERATE_INFOPLIST_FILE: false
+        CODE_SIGN_ENTITLEMENTS: WeatherApp/WeatherApp.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: WeatherWidgetExtension
+  WeatherWidgetExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - WeatherWidgetExtension
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.weatherwidget.app.widget
+        INFOPLIST_FILE: WeatherWidgetExtension/Info.plist
+        GENERATE_INFOPLIST_FILE: false
+        CODE_SIGN_ENTITLEMENTS: WeatherWidgetExtension/WeatherWidgetExtension.entitlements
+        SKIP_INSTALL: true
