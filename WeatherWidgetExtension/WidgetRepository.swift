@@ -1,4 +1,5 @@
 import Foundation
+import WidgetKit
 
 /// Widget 端数据仓库：只读 App Group 共享快照，必要时用 Open-Meteo 兜底刷新分钟级
 struct WidgetRepository {
