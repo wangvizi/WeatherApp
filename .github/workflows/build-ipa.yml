@@ -28,12 +28,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build
 
-      - name: Ad-hoc sign & package IPA
+      - name: Ad-hoc sign with entitlements & package IPA
         run: |
           APP=dd/Build/Products/Release-iphoneos/WeatherApp.app
           codesign --force --sign - --timestamp=none \
-            "$APP/PlugIns/WeatherWidgetExtension.appex" 2>/dev/null || true
-          codesign --force --sign - --timestamp=none "$APP" 2>/dev/null || true
+            --entitlements WeatherWidgetExtension/WeatherWidgetExtension.entitlements \
+            "$APP/PlugIns/WeatherWidgetExtension.appex"
+          codesign --force --sign - --timestamp=none \
+            --entitlements WeatherApp/WeatherApp.entitlements \
+            "$APP"
+          codesign --verify --deep --strict "$APP" || true
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qr WeatherApp-unsigned.ipa Payload
